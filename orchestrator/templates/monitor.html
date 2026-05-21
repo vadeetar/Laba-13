@@ -1,0 +1,128 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <title>MAS Monitor — Вариант 18</title>
+  <style>
+    body { font-family: system-ui, sans-serif; margin: 0; background: #eef2f7; color: #1a1a2e; }
+    header { background: #1e3a5f; color: #fff; padding: 1.2rem 2rem; }
+    main { display: grid; grid-template-columns: 1fr 1fr; gap: 1.2rem; padding: 1.5rem 2rem; max-width: 1200px; margin: 0 auto; }
+    .card { background: #fff; border-radius: 10px; padding: 1.2rem; box-shadow: 0 2px 10px #0001; }
+    h2 { margin-top: 0; font-size: 1.1rem; color: #1e3a5f; }
+    table { width: 100%; border-collapse: collapse; font-size: 0.9rem; }
+    th, td { text-align: left; padding: 0.45rem 0.5rem; border-bottom: 1px solid #e8ecf1; }
+    .ok { color: #0a7; font-weight: 600; }
+    .warn { color: #c80; }
+    form label { display: block; margin: 0.4rem 0 0.15rem; font-size: 0.85rem; }
+    input, select { width: 100%; padding: 0.45rem; border: 1px solid #ccd; border-radius: 6px; box-sizing: border-box; }
+    button { margin-top: 0.8rem; background: #1e3a5f; color: #fff; border: 0; padding: 0.55rem 1.2rem; border-radius: 6px; cursor: pointer; }
+    button:hover { background: #2a5080; }
+    pre { background: #f4f6f9; padding: 0.6rem; border-radius: 6px; font-size: 0.75rem; overflow: auto; max-height: 180px; }
+    .full { grid-column: 1 / -1; }
+    a { color: #1e6fd9; }
+    .meta { font-size: 0.85rem; color: #556; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Система поддержки пациентов — панель мониторинга</h1>
+    <p class="meta">Вариант 18 · NATS · Redis · Jaeger · Аукцион · Автомасштабирование</p>
+  </header>
+
+  <main>
+    <section class="card">
+      <h2>Статус системы</h2>
+      <table>
+        <tr><td>Обработано задач</td><td><b>{{ tasks_processed }}</b></td></tr>
+        <tr><td>Очередь (Redis)</td><td><b class="{% if queue_depth > queue_threshold %}warn{% else %}ok{% endif %}">{{ queue_depth }}</b> / порог {{ queue_threshold }}</td></tr>
+        <tr><td>NATS</td><td class="ok">{{ "подключён" if nats_ok else "нет" }}</td></tr>
+        <tr><td>Отзывов в Redis</td><td>{{ feedback_total }}</td></tr>
+        <tr><td>Jaeger UI</td><td><a href="{{ jaeger_ui }}" target="_blank">{{ jaeger_ui }}</a></td></tr>
+      </table>
+    </section>
+
+    <section class="card">
+      <h2>Агенты</h2>
+      <table>
+        <tr><th>Агент</th><th>Роль</th><th>Статус</th></tr>
+        {% for agent in agents %}
+        <tr>
+          <td>{{ agent.name }}</td>
+          <td>{{ agent.role }}</td>
+          <td class="ok">{{ agent.status }}</td>
+        </tr>
+        {% endfor %}
+      </table>
+    </section>
+
+    <section class="card">
+      <h2>Последний аукцион</h2>
+      {% if auction_winner %}
+      <p>Победитель: <b>{{ auction_winner.agent_id or auction_winner.name }}</b> (cost={{ auction_winner.cost }}, skill={{ auction_winner.skill }})</p>
+      <table>
+        <tr><th>Агент</th><th>Cost</th><th>Skill</th></tr>
+        {% for bid in auction_bids %}
+        <tr>
+          <td>{{ bid.agent_id }}</td>
+          <td>{{ bid.cost }}</td>
+          <td>{{ bid.skill }}</td>
+        </tr>
+        {% endfor %}
+      </table>
+      {% else %}
+      <p class="meta">Аукцион ещё не проводился</p>
+      {% endif %}
+    </section>
+
+    <section class="card">
+      <h2>Автомасштабирование</h2>
+      <p class="meta">При queue &gt; {{ queue_threshold }} orchestrator вызывает <code>docker compose scale</code></p>
+      <ul>
+        {% for ev in autoscale_events %}
+        <li>{{ ev }}</li>
+        {% else %}
+        <li class="meta">Событий пока нет</li>
+        {% endfor %}
+      </ul>
+    </section>
+
+    <section class="card full">
+      <h2>Ручной запуск задачи (Pipeline)</h2>
+      <form method="post" action="/monitor/run">
+        <label>ID пациента</label>
+        <input name="patient_id" value="PAT001" required>
+        <label>Имя</label>
+        <input name="first_name" value="Иван" required>
+        <label>Фамилия</label>
+        <input name="last_name" value="Петров" required>
+        <label>Симптомы (через запятую)</label>
+        <input name="symptoms" value="chest pain" required>
+        <label>Срочность</label>
+        <select name="urgency">
+          <option value="high">high</option>
+          <option value="normal" selected>normal</option>
+        </select>
+        <label>Оценка (feedback)</label>
+        <input name="rating" type="number" min="1" max="5" value="5">
+        <button type="submit">Запустить pipeline</button>
+      </form>
+      {% if run_error %}
+      <p class="warn">{{ run_error }}</p>
+      {% endif %}
+      {% if last_run_result %}
+      <h3>Результат последнего запуска</h3>
+      <pre>{{ last_run_result }}</pre>
+      {% endif %}
+    </section>
+
+    <section class="card full">
+      <h2>Последние результаты задач</h2>
+      {% for item in recent_results %}
+      <pre>{{ item }}</pre>
+      {% else %}
+      <p class="meta">Нет завершённых задач</p>
+      {% endfor %}
+    </section>
+  </main>
+</body>
+</html>

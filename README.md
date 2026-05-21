@@ -2,52 +2,9 @@
 
 **Студент:** Тарасов Вадим Романович  
 **Группа:** 221131  
-**Вариант:** 18  
-**Сложность:** Повышенная  
-
-Система автоматизации записи и обслуживания пациентов на базе мультиагентной архитектуры (MAS).
+**Вариант:** 18 (повышенная сложность)
 
 **Предметная область:** запись к врачу, напоминание о приёме, сбор обратной связи, триаж.
-
----
-
-## Архитектура
-
-| Компонент | Технология | Роль |
-|-----------|------------|------|
-| Оркестратор | Python / FastAPI | Pipeline, аукцион, retry, REST API |
-| Triage Agent | Go | Классификация симптомов, приоритет |
-| Appointment Agent ×2 | Go | Запись к врачу (балансировка + аукцион) |
-| Reminder Agent | Go | Напоминания о визите |
-| Feedback Agent | Go + Redis | Stateful-сбор отзывов |
-| LLM Agent | Python | Анализ симптомов (имитация LLM) |
-| NATS | Docker | Брокер сообщений |
-| Jaeger | Docker | Распределённая трассировка (OpenTelemetry) |
-
-### Pipeline
-
-```mermaid
-sequenceDiagram
-    participant Client
-    participant Orchestrator
-    participant Triage
-    participant LLM
-    participant Appointment
-    participant Reminder
-    participant Feedback
-    Client->>Orchestrator: POST /patients/register
-    Orchestrator->>Triage: tasks.triage
-    Triage-->>Orchestrator: priority, specialty
-    Orchestrator->>LLM: tasks.llm
-    LLM-->>Orchestrator: analysis
-    Orchestrator->>Appointment: tasks.appointment (auction)
-    Appointment-->>Orchestrator: appointment_id
-    Orchestrator->>Reminder: tasks.reminder
-    Reminder-->>Orchestrator: sent
-    Orchestrator->>Feedback: tasks.feedback
-    Feedback-->>Orchestrator: stats from Redis
-    Orchestrator-->>Client: 200 OK
-```
 
 ---
 
@@ -58,15 +15,39 @@ cp .env.example .env
 docker compose up --build
 ```
 
-- API: http://localhost:8000/docs
-- Мониторинг: http://localhost:8000/monitor
-- Jaeger: http://localhost:16686
+Опционально — включить Ollama (облачный/локальный LLM):
+
+```bash
+docker compose --profile ollama up -d
+docker exec -it lab13_mas-ollama-1 ollama pull llama3.2
+```
+
+Без профиля `ollama` LLM-агент использует встроенный fallback (правила по ключевым словам).
+
+| Сервис | URL |
+|--------|-----|
+| API / Swagger | http://localhost:8000/docs |
+| Мониторинг | http://localhost:8000/monitor |
+| Jaeger | http://localhost:16686 |
+
+---
+
+## Реализация 8 заданий (повышенная сложность)
+
+| № | Задание | Где реализовано |
+|---|---------|-----------------|
+| 1 | 4+ Go-агента + NATS | `agents/triage`, `appointment`, `reminder`, `feedback` + `docker-compose.yml` |
+| 2 | Pipeline | `orchestrator/app/main.py` → triage → llm → appointment → reminder → feedback |
+| 3 | Jaeger + OpenTelemetry | OTLP во всех Go-агентах, оркестраторе; W3C trace через NATS headers |
+| 4 | Stateful Redis | `agents/feedback` — счётчики, средний балл, ping при старте |
+| 5 | Автомасштабирование | `orchestrator/app/autoscale.py` — очередь в Redis, `docker compose scale` |
+| 6 | Аукцион | `tasks.auction` — агенты шлют `{cost, skill}`; оркестратор выбирает минимум |
+| 7 | LLM-агент | `agents/llm` — Ollama API + fallback на правила |
+| 8 | Веб-мониторинг | `GET /monitor` — Jinja2: агенты, очередь, аукцион, форма запуска |
 
 ---
 
 ## API
-
-### Регистрация пациента (основной endpoint)
 
 `POST /patients/register`
 
@@ -77,43 +58,48 @@ docker compose up --build
   "last_name": "Петров",
   "symptoms": ["chest pain"],
   "urgency": "high",
-  "appointment_date": "2026-05-25",
   "rating": 5
 }
 ```
 
-### Статус системы
+---
 
-- `GET /health` — проверка работоспособности
-- `GET /status` — агенты, счётчик задач, аукцион
-- `GET /monitor` — веб-панель мониторинга
+## Архитектура
+
+```mermaid
+sequenceDiagram
+    participant UI as /monitor
+    participant Orch as Orchestrator
+    participant Triage
+    participant LLM as LLM/Ollama
+    participant Auction
+    participant Appt as Appointment
+    participant Rem as Reminder
+    participant Feed as Feedback/Redis
+    UI->>Orch: POST /patients/register
+    Orch->>Triage: tasks.triage
+    Orch->>LLM: tasks.llm
+    Orch->>Auction: tasks.auction (bids)
+    Orch->>Appt: tasks.appointment
+    Orch->>Rem: tasks.reminder
+    Orch->>Feed: tasks.feedback
+    Orch-->>UI: JSON result
+```
 
 ---
 
-## Реализованные требования (повышенная сложность)
+## Проверка для преподавателя
 
-1. **4 Go-агента + LLM** — triage, appointment (×2), reminder, feedback, llm
-2. **Pipeline** — последовательная цепочка через оркестратор
-3. **Jaeger / OpenTelemetry** — OTLP exporter в оркестраторе и агентах
-4. **Stateful (Redis)** — feedback-agent хранит счётчики в Redis
-5. **Автомасштабирование** — проверка длины очереди в оркестраторе
-6. **Аукцион** — выбор appointment-agent с минимальным `cost`
-7. **LLM-агент** — анализ симптомов на Python
-8. **Мониторинг** — `/monitor`, `/status`
-
-Дополнительно: **retry до 3 раз**, **логи в файл**, **Request-Reply NATS**, **2 экземпляра appointment-agent**.
+1. `docker compose up --build` — все сервисы в статусе running.
+2. http://localhost:8000/monitor — форма «Запустить pipeline».
+3. http://localhost:16686 — трейсы `patient-pipeline`, `auction.collect_bids`.
+4. `GET /status` — очередь, последний аукцион, счётчик задач.
 
 ---
 
 ## Тесты
 
 ```bash
-cd orchestrator
-pip install -r requirements.txt
-pytest app/tests -v
-```
-
-```bash
-cd agents/triage
-go test ./...
+cd orchestrator && pip install -r requirements.txt && pytest app/tests -v
+cd agents/triage && go test ./...
 ```

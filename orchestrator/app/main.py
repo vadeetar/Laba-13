@@ -5,10 +5,11 @@ import os
 import sys
 import uuid
 from datetime import datetime, timedelta
-from typing import Any, Optional
+from typing import Optional
 
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import HTMLResponse
+from fastapi import FastAPI, Form, HTTPException, Request
+from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, Field
 
 import nats
@@ -19,7 +20,18 @@ from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExport
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import BatchSpanProcessor
 
+from app import state
+from app.auction import collect_auction_bids
+from app.autoscale import (
+    get_autoscale_events,
+    get_redis,
+    queue_depth,
+    queue_pop,
+    queue_push,
+    try_scale_appointment_agents,
+)
 from app.config import settings
+from app.tracing_util import nats_request_with_trace, tracer
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -46,28 +58,32 @@ if not otlp_endpoint.endswith("/v1/traces"):
     otlp_endpoint = f"{otlp_endpoint}/v1/traces"
 
 trace.set_tracer_provider(TracerProvider())
-tracer = trace.get_tracer(__name__)
 trace.get_tracer_provider().add_span_processor(
     BatchSpanProcessor(OTLPSpanExporter(endpoint=otlp_endpoint))
 )
 
 # ---------------------------------------------------------------------------
-# App state
+# App
 # ---------------------------------------------------------------------------
 
 app = FastAPI(
     title="Система поддержки пациентов",
     description="Лабораторная работа №13, вариант 18 — MAS",
-    version="1.0.0",
+    version="2.0.0",
 )
 
-nc: Optional[nats.NATS] = None
-tasks_processed = 0
-last_auction_winner: Optional[dict] = None
+templates = Jinja2Templates(directory=os.path.join(os.path.dirname(__file__), "..", "templates"))
 
-# ---------------------------------------------------------------------------
-# Models
-# ---------------------------------------------------------------------------
+nc: Optional[nats.NATS] = None
+
+AGENTS_META = [
+    {"name": "triage-agent", "role": "Триаж симптомов", "status": "active"},
+    {"name": "appointment-agent", "role": "Запись к врачу", "status": "active"},
+    {"name": "appointment-agent-2", "role": "Запись (реплика)", "status": "active"},
+    {"name": "reminder-agent", "role": "Напоминания", "status": "active"},
+    {"name": "feedback-agent", "role": "Обратная связь + Redis", "status": "active"},
+    {"name": "llm-agent", "role": "LLM-анализ (Ollama)", "status": "active"},
+]
 
 
 class PatientRegisterRequest(BaseModel):
@@ -87,42 +103,7 @@ class LegacyProcessRequest(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# Auction & autoscaling
-# ---------------------------------------------------------------------------
-
-APPOINTMENT_AGENTS = [
-    {"name": "appointment-agent", "cost": 3, "skill": 0.95},
-    {"name": "appointment-agent-2", "cost": 1, "skill": 0.80},
-]
-
-
-def choose_appointment_agent() -> dict:
-    """Аукцион: выбираем агента с минимальной стоимостью."""
-    global last_auction_winner
-    winner = min(APPOINTMENT_AGENTS, key=lambda x: (x["cost"], -x["skill"]))
-    last_auction_winner = winner
-    logger.info(
-        "Auction winner: %s (cost=%s, skill=%s)",
-        winner["name"],
-        winner["cost"],
-        winner["skill"],
-    )
-    return winner
-
-
-def autoscaling_check(queue_size: int = 15) -> bool:
-    if queue_size > settings.queue_scale_threshold:
-        logger.warning(
-            "Autoscaling: queue_size=%d > %d — запуск дополнительного агента",
-            queue_size,
-            settings.queue_scale_threshold,
-        )
-        return True
-    return False
-
-
-# ---------------------------------------------------------------------------
-# NATS helpers
+# NATS
 # ---------------------------------------------------------------------------
 
 
@@ -142,18 +123,11 @@ async def nats_request(
 
     for attempt in range(1, retries + 1):
         try:
-            with tracer.start_as_current_span(f"nats.request.{subject}"):
-                msg = await nc.request(subject, data, timeout=timeout)
-                return json.loads(msg.data.decode())
+            msg = await nats_request_with_trace(nc, subject, data, timeout)
+            return json.loads(msg.data.decode())
         except (NatsTimeoutError, asyncio.TimeoutError, Exception) as exc:
             last_error = exc
-            logger.warning(
-                "Retry %d/%d for %s failed: %s",
-                attempt,
-                retries,
-                subject,
-                exc,
-            )
+            logger.warning("Retry %d/%d for %s failed: %s", attempt, retries, subject, exc)
             if attempt < retries:
                 await asyncio.sleep(0.3 * attempt)
 
@@ -167,86 +141,102 @@ def default_appointment_date() -> str:
     return (datetime.utcnow() + timedelta(days=3)).strftime("%Y-%m-%d")
 
 
-async def run_patient_pipeline(body: PatientRegisterRequest) -> dict:
-    global tasks_processed
+def feedback_total_from_redis() -> int:
+    try:
+        val = get_redis().get("total_feedbacks")
+        return int(val or 0)
+    except Exception:
+        return 0
 
+
+async def run_patient_pipeline(body: PatientRegisterRequest) -> dict:
     task_id = str(uuid.uuid4())
     patient_name = f"{body.first_name} {body.last_name}".strip()
     appointment_date = body.appointment_date or default_appointment_date()
 
-    with tracer.start_as_current_span("patient-pipeline") as span:
-        span.set_attribute("patient.id", body.patient_id)
-        autoscaling_check()
+    depth = queue_push()
+    try:
+        scaled = try_scale_appointment_agents(depth)
+        if scaled:
+            logger.info("Autoscale triggered at queue depth %d", depth)
 
-        # 1. Триаж
-        triage_result = await nats_request(
-            "tasks.triage",
-            {
-                "id": task_id,
+        with tracer.start_as_current_span("patient-pipeline") as span:
+            span.set_attribute("patient.id", body.patient_id)
+            span.set_attribute("queue.depth", depth)
+
+            triage_result = await nats_request(
+                "tasks.triage",
+                {
+                    "id": task_id,
+                    "patient": patient_name,
+                    "symptoms": body.symptoms,
+                    "urgency": body.urgency,
+                },
+            )
+
+            llm_result = await nats_request(
+                "tasks.llm",
+                {
+                    "id": task_id,
+                    "patient": patient_name,
+                    "symptoms": body.symptoms,
+                },
+            )
+
+            auction_winner, auction_bids = await collect_auction_bids(
+                nc, task_id, timeout_sec=settings.auction_timeout
+            )
+            state.last_auction_winner = auction_winner
+            state.last_auction_bids = auction_bids
+
+            appointment_result = await nats_request(
+                "tasks.appointment",
+                {
+                    "id": task_id,
+                    "patient": patient_name,
+                    "date": appointment_date,
+                    "specialty": triage_result.get("specialty", "терапевт"),
+                    "preferred_agent": auction_winner.get("agent_id"),
+                    "agent_cost": auction_winner.get("cost"),
+                },
+            )
+
+            reminder_result = await nats_request(
+                "tasks.reminder",
+                {"id": task_id, "patient": patient_name, "date": appointment_date},
+            )
+
+            feedback_result = await nats_request(
+                "tasks.feedback",
+                {"id": task_id, "patient": patient_name, "rating": body.rating},
+            )
+
+            state.tasks_processed += 1
+
+            result = {
+                "task_id": task_id,
+                "patient_id": body.patient_id,
                 "patient": patient_name,
-                "symptoms": body.symptoms,
-                "urgency": body.urgency,
-            },
-        )
-
-        # 2. LLM-анализ симптомов
-        llm_result = await nats_request(
-            "tasks.llm",
-            {
-                "id": task_id,
-                "patient": patient_name,
-                "symptoms": body.symptoms,
-            },
-        )
-
-        # 3. Запись к врачу (аукцион)
-        auction_winner = choose_appointment_agent()
-        appointment_result = await nats_request(
-            "tasks.appointment",
-            {
-                "id": task_id,
-                "patient": patient_name,
-                "date": appointment_date,
-                "specialty": triage_result.get("specialty", "терапевт"),
-                "agent_cost": auction_winner["cost"],
-                "preferred_agent": auction_winner["name"],
-            },
-        )
-
-        # 4. Напоминание
-        reminder_result = await nats_request(
-            "tasks.reminder",
-            {
-                "id": task_id,
-                "patient": patient_name,
-                "date": appointment_date,
-            },
-        )
-
-        # 5. Обратная связь (stateful / Redis)
-        feedback_result = await nats_request(
-            "tasks.feedback",
-            {
-                "id": task_id,
-                "patient": patient_name,
-                "rating": body.rating,
-            },
-        )
-
-        tasks_processed += 1
-
-        return {
-            "task_id": task_id,
-            "patient_id": body.patient_id,
-            "patient": patient_name,
-            "appointment_date": appointment_date,
-            "auction": auction_winner,
-            "triage": triage_result,
-            "llm": llm_result,
-            "appointment": appointment_result,
-            "reminder": reminder_result,
-            "feedback": feedback_result,
-        }
+                "appointment_date": appointment_date,
+                "queue_depth_at_start": depth,
+                "auction": {"winner": auction_winner, "bids": auction_bids},
+                "triage": triage_result,
+                "llm": llm_result,
+                "appointment": appointment_result,
+                "reminder": reminder_result,
+                "feedback": feedback_result,
+            }
+            state.recent_results.appendleft(
+                {
+                    "task_id": task_id,
+                    "patient": patient_name,
+                    "priority": triage_result.get("priority"),
+                    "at": datetime.utcnow().isoformat(),
+                }
+            )
+            return result
+    finally:
+        queue_pop()
 
 
 # ---------------------------------------------------------------------------
@@ -258,19 +248,29 @@ async def run_patient_pipeline(body: PatientRegisterRequest) -> dict:
 async def startup():
     global nc
     nc = await nats.connect(settings.nats_url)
-    logger.info("Connected to NATS at %s", settings.nats_url)
+    get_redis().ping()
+    logger.info("Connected to NATS at %s, Redis OK", settings.nats_url)
 
 
 @app.on_event("shutdown")
 async def shutdown():
     if nc:
         await nc.close()
-        logger.info("NATS connection closed")
 
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "nats": nc is not None and nc.is_connected}
+    redis_ok = False
+    try:
+        get_redis().ping()
+        redis_ok = True
+    except Exception:
+        pass
+    return {
+        "status": "ok",
+        "nats": nc is not None and nc.is_connected,
+        "redis": redis_ok,
+    }
 
 
 @app.get("/status")
@@ -278,49 +278,75 @@ async def status():
     return {
         "variant": 18,
         "domain": "Система поддержки пациентов",
-        "agents": [
-            "triage-agent",
-            "appointment-agent",
-            "appointment-agent-2",
-            "reminder-agent",
-            "feedback-agent",
-            "llm-agent",
-        ],
-        "tasks_processed": tasks_processed,
-        "last_auction_winner": last_auction_winner,
+        "agents": [a["name"] for a in AGENTS_META],
+        "tasks_processed": state.tasks_processed,
+        "queue_depth": queue_depth(),
+        "last_auction_winner": state.last_auction_winner,
+        "last_auction_bids": state.last_auction_bids,
         "jaeger_ui": "http://localhost:16686",
+        "monitor_ui": "http://localhost:8000/monitor",
+    }
+
+
+def _monitor_context(request: Request) -> dict:
+    return {
+        "request": request,
+        "tasks_processed": state.tasks_processed,
+        "queue_depth": queue_depth(),
+        "queue_threshold": settings.queue_scale_threshold,
+        "nats_ok": nc is not None and nc.is_connected,
+        "feedback_total": feedback_total_from_redis(),
+        "jaeger_ui": "http://localhost:16686",
+        "agents": AGENTS_META,
+        "auction_winner": state.last_auction_winner,
+        "auction_bids": state.last_auction_bids,
+        "autoscale_events": get_autoscale_events(),
+        "recent_results": list(state.recent_results),
+        "run_error": state.last_run_error,
+        "last_run_result": state.last_run_result,
     }
 
 
 @app.get("/monitor", response_class=HTMLResponse)
-async def monitor():
-    winner = last_auction_winner or {}
-    return f"""
-    <!DOCTYPE html>
-    <html lang="ru">
-    <head><meta charset="utf-8"><title>MAS Monitor — Вариант 18</title>
-    <style>body{{font-family:sans-serif;margin:2rem;background:#f5f7fb}}
-    .card{{background:#fff;padding:1.5rem;border-radius:8px;max-width:720px;box-shadow:0 2px 8px #0001}}</style>
-    </head>
-    <body>
-    <div class="card">
-    <h1>🏥 Мониторинг агентов</h1>
-    <p><b>Обработано задач:</b> {tasks_processed}</p>
-    <p><b>Аукцион (последний победитель):</b> {winner.get("name", "—")} (cost={winner.get("cost", "—")})</p>
-    <p><b>Jaeger:</b> <a href="http://localhost:16686" target="_blank">localhost:16686</a></p>
-    <p><b>API:</b> POST /patients/register</p>
-    </div>
-    </body></html>
-    """
+async def monitor_page(request: Request):
+    state.last_run_error = ""
+    return templates.TemplateResponse("monitor.html", _monitor_context(request))
+
+
+@app.post("/monitor/run")
+async def monitor_run(
+    request: Request,
+    patient_id: str = Form(...),
+    first_name: str = Form(...),
+    last_name: str = Form(...),
+    symptoms: str = Form(...),
+    urgency: str = Form("normal"),
+    rating: int = Form(5),
+):
+    body = PatientRegisterRequest(
+        patient_id=patient_id,
+        first_name=first_name,
+        last_name=last_name,
+        symptoms=[s.strip() for s in symptoms.split(",") if s.strip()],
+        urgency=urgency,
+        rating=rating,
+    )
+    try:
+        result = await run_patient_pipeline(body)
+        state.last_run_result = json.dumps(result, ensure_ascii=False, indent=2)
+        state.last_run_error = ""
+        return RedirectResponse(url="/monitor", status_code=303)
+    except HTTPException as exc:
+        state.last_run_error = str(exc.detail)
+        state.last_run_result = ""
+        return templates.TemplateResponse("monitor.html", _monitor_context(request))
 
 
 @app.post("/patients/register")
 async def register_patient(body: PatientRegisterRequest):
-    logger.info("Register patient_id=%s urgency=%s", body.patient_id, body.urgency)
+    logger.info("Register patient_id=%s", body.patient_id)
     try:
-        result = await run_patient_pipeline(body)
-        logger.info("Pipeline completed task_id=%s", result["task_id"])
-        return result
+        return await run_patient_pipeline(body)
     except HTTPException:
         raise
     except Exception as exc:
@@ -330,7 +356,6 @@ async def register_patient(body: PatientRegisterRequest):
 
 @app.post("/process")
 async def process_legacy(body: LegacyProcessRequest):
-    """Совместимость со старым API."""
     mapped = PatientRegisterRequest(
         patient_id=str(uuid.uuid4())[:8],
         first_name=body.patient,

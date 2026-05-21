@@ -11,6 +11,7 @@ import (
 	"github.com/nats-io/nats.go"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp"
+	"go.opentelemetry.io/otel/propagation"
 	"go.opentelemetry.io/otel/sdk/trace"
 )
 
@@ -37,6 +38,37 @@ func setupLogger() {
 		}
 	}
 	log.SetOutput(io.MultiWriter(writers...))
+}
+
+func extractCtx(msg *nats.Msg) context.Context {
+	ctx := context.Background()
+	if msg.Header == nil {
+		return ctx
+	}
+	carrier := propagation.MapCarrier{}
+	for k, vals := range msg.Header {
+		if len(vals) > 0 {
+			carrier[k] = vals[0]
+		}
+	}
+	return otel.GetTextMapPropagator().Extract(ctx, carrier)
+}
+
+func respondWithTrace(ctx context.Context, msg *nats.Msg, nc *nats.Conn, data []byte) {
+	if msg.Reply == "" {
+		return
+	}
+	resp := nats.NewMsg(msg.Reply)
+	resp.Data = data
+	if resp.Header == nil {
+		resp.Header = nats.Header{}
+	}
+	carrier := propagation.MapCarrier{}
+	otel.GetTextMapPropagator().Inject(ctx, carrier)
+	for k, v := range carrier {
+		resp.Header.Set(k, v)
+	}
+	_ = nc.PublishMsg(resp)
 }
 
 func initTracer() {
@@ -118,7 +150,7 @@ func main() {
 	tracer := otel.Tracer("triage-agent")
 
 	_, err = nc.QueueSubscribe("tasks.triage", "triage-workers", func(msg *nats.Msg) {
-		_, span := tracer.Start(context.Background(), "triage-processing")
+		ctx, span := tracer.Start(extractCtx(msg), "triage-processing")
 		defer span.End()
 
 		var task TriageTask
@@ -131,13 +163,7 @@ func main() {
 		result := processTriage(task)
 		data, _ := json.Marshal(result)
 
-		if msg.Reply != "" {
-			if err := msg.Respond(data); err != nil {
-				log.Printf("ERROR respond: %v", err)
-			}
-		} else {
-			_ = nc.Publish("tasks.triage.done", data)
-		}
+		respondWithTrace(ctx, msg, nc, data)
 	})
 	if err != nil {
 		log.Fatal(err)

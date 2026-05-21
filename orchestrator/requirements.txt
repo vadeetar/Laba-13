@@ -2,6 +2,9 @@ fastapi
 uvicorn
 nats-py
 pydantic-settings
+jinja2
+redis
+httpx
 
 opentelemetry-api
 opentelemetry-sdk

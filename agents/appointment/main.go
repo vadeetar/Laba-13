@@ -11,6 +11,7 @@ import (
 	"github.com/nats-io/nats.go"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp"
+	"go.opentelemetry.io/otel/propagation"
 	"go.opentelemetry.io/otel/sdk/trace"
 )
 
@@ -19,7 +20,6 @@ type AppointmentTask struct {
 	Patient   string `json:"patient"`
 	Date      string `json:"date"`
 	Specialty string `json:"specialty,omitempty"`
-	AgentCost int    `json:"agent_cost,omitempty"`
 }
 
 type AppointmentResult struct {
@@ -29,6 +29,13 @@ type AppointmentResult struct {
 	AgentID     string `json:"agent_id"`
 	AgentCost   int    `json:"agent_cost"`
 	Appointment string `json:"appointment_id"`
+}
+
+type AuctionBid struct {
+	AgentID   string  `json:"agent_id"`
+	Cost      int     `json:"cost"`
+	Skill     float64 `json:"skill"`
+	Available bool    `json:"available"`
 }
 
 func setupLogger() {
@@ -47,7 +54,7 @@ func initTracer() {
 	ctx := context.Background()
 	exporter, err := otlptracehttp.New(ctx)
 	if err != nil {
-		log.Printf("OTLP exporter: %v, using default provider", err)
+		log.Printf("OTLP exporter: %v", err)
 		otel.SetTracerProvider(trace.NewTracerProvider())
 		return
 	}
@@ -55,7 +62,40 @@ func initTracer() {
 	otel.SetTracerProvider(tp)
 }
 
-func agentMeta() (string, int) {
+func extractCtx(msg *nats.Msg) context.Context {
+	ctx := context.Background()
+	if msg.Header == nil {
+		return ctx
+	}
+	carrier := propagation.MapCarrier{}
+	for k, vals := range msg.Header {
+		if len(vals) > 0 {
+			carrier[k] = vals[0]
+		}
+	}
+	return otel.GetTextMapPropagator().Extract(ctx, carrier)
+}
+
+func respondWithTrace(ctx context.Context, msg *nats.Msg, nc *nats.Conn, data []byte) {
+	if msg.Reply == "" {
+		return
+	}
+	resp := nats.NewMsg(msg.Reply)
+	resp.Data = data
+	if resp.Header == nil {
+		resp.Header = nats.Header{}
+	}
+	carrier := propagation.MapCarrier{}
+	otel.GetTextMapPropagator().Inject(ctx, carrier)
+	for k, v := range carrier {
+		resp.Header.Set(k, v)
+	}
+	if err := nc.PublishMsg(resp); err != nil {
+		log.Printf("ERROR respond: %v", err)
+	}
+}
+
+func agentMeta() (string, int, float64) {
 	id := os.Getenv("AGENT_ID")
 	if id == "" {
 		id = "appointment-agent"
@@ -66,14 +106,20 @@ func agentMeta() (string, int) {
 			cost = v
 		}
 	}
-	return id, cost
+	skill := 0.85
+	if raw := os.Getenv("AGENT_SKILL"); raw != "" {
+		if v, err := strconv.ParseFloat(raw, 64); err == nil {
+			skill = v
+		}
+	}
+	return id, cost, skill
 }
 
 func main() {
 	setupLogger()
 	initTracer()
 
-	agentID, agentCost := agentMeta()
+	agentID, agentCost, agentSkill := agentMeta()
 
 	natsURL := os.Getenv("NATS_URL")
 	if natsURL == "" {
@@ -85,11 +131,30 @@ func main() {
 		log.Fatal(err)
 	}
 
-	log.Printf("INFO Appointment Agent connected id=%s cost=%d", agentID, agentCost)
+	log.Printf("INFO Appointment Agent id=%s cost=%d skill=%.2f", agentID, agentCost, agentSkill)
 	tracer := otel.Tracer(agentID)
 
+	// Аукцион: каждый агент отвечает ставкой (не queue — все получают запрос)
+	_, err = nc.Subscribe("tasks.auction", func(msg *nats.Msg) {
+		ctx, span := tracer.Start(extractCtx(msg), "auction-bid")
+		defer span.End()
+
+		bid := AuctionBid{
+			AgentID:   agentID,
+			Cost:      agentCost,
+			Skill:     agentSkill,
+			Available: true,
+		}
+		data, _ := json.Marshal(bid)
+		respondWithTrace(ctx, msg, nc, data)
+		log.Printf("INFO auction bid sent agent=%s cost=%d", agentID, agentCost)
+	})
+	if err != nil {
+		log.Fatal(err)
+	}
+
 	_, err = nc.QueueSubscribe("tasks.appointment", "appointment-workers", func(msg *nats.Msg) {
-		_, span := tracer.Start(context.Background(), "appointment-processing")
+		ctx, span := tracer.Start(extractCtx(msg), "appointment-processing")
 		defer span.End()
 
 		var task AppointmentTask
@@ -98,7 +163,7 @@ func main() {
 			return
 		}
 
-		log.Printf("INFO appointment patient=%s date=%s specialty=%s", task.Patient, task.Date, task.Specialty)
+		log.Printf("INFO appointment patient=%s specialty=%s", task.Patient, task.Specialty)
 
 		result := AppointmentResult{
 			TaskID:      task.ID,
@@ -109,15 +174,7 @@ func main() {
 			Appointment: "APT-" + task.ID[:8],
 		}
 		data, _ := json.Marshal(result)
-
-		if msg.Reply != "" {
-			if err := msg.Respond(data); err != nil {
-				log.Printf("ERROR respond: %v", err)
-			}
-		} else {
-			_ = nc.Publish("tasks.appointment.done", data)
-		}
-		log.Println("INFO appointment processed")
+		respondWithTrace(ctx, msg, nc, data)
 	})
 	if err != nil {
 		log.Fatal(err)

@@ -18,6 +18,14 @@ services:
     environment:
       - COLLECTOR_OTLP_ENABLED=true
 
+  ollama:
+    profiles: ["ollama"]
+    image: ollama/ollama:latest
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama-data:/root/.ollama
+
   orchestrator:
     build: ./orchestrator
     ports:
@@ -26,10 +34,16 @@ services:
       - .env
     environment:
       - NATS_URL=nats://nats:4222
+      - REDIS_URL=redis://redis:6379
       - OTEL_EXPORTER_OTLP_ENDPOINT=http://jaeger:4318
       - LOG_FILE=/app/logs/orchestrator.log
+      - COMPOSE_FILE=/workspace/docker-compose.yml
+      - COMPOSE_PROJECT_NAME=lab13_mas
+      - AUTOSCALE_ENABLED=true
     volumes:
       - orchestrator-logs:/app/logs
+      - .:/workspace
+      - /var/run/docker.sock:/var/run/docker.sock
     depends_on:
       - nats
       - jaeger
@@ -56,6 +70,7 @@ services:
       - OTEL_SERVICE_NAME=appointment-agent
       - AGENT_ID=appointment-agent
       - AGENT_COST=3
+      - AGENT_SKILL=0.95
       - LOG_FILE=/app/logs/appointment-1.log
     volumes:
       - agent-logs:/app/logs
@@ -71,6 +86,7 @@ services:
       - OTEL_SERVICE_NAME=appointment-agent-2
       - AGENT_ID=appointment-agent-2
       - AGENT_COST=1
+      - AGENT_SKILL=0.80
       - LOG_FILE=/app/logs/appointment-2.log
     volumes:
       - agent-logs:/app/logs
@@ -110,6 +126,8 @@ services:
     build: ./agents/llm
     environment:
       - NATS_URL=nats://nats:4222
+      - OLLAMA_URL=http://ollama:11434
+      - OLLAMA_MODEL=llama3.2
       - LOG_FILE=/app/logs/llm.log
     volumes:
       - agent-logs:/app/logs
@@ -119,3 +137,4 @@ services:
 volumes:
   orchestrator-logs:
   agent-logs:
+  ollama-data:
