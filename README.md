@@ -1,42 +1,95 @@
-# Распределенная мультиагентная система «Поддержка пациентов»
 
-Реализация распределенной микросервисной архитектуры (MAS) с центральным оркестратором, асинхронной шиной сообщений NATS и постоянным хранилищем состояний Redis.
+# 🏥 Система поддержки пациентов (Lab 13)
 
-## Вариант: 18
+Система автоматизации процессов записи и обслуживания пациентов на базе микросервисной архитектуры. Реализована в рамках лабораторной работы №13 (Вариант 18).
 
-## 🏗 Архитектура системы
-
-Система состоит из следующих независимых компонентов:
-- **Оркестратор (Python / FastAPI)**: Центральный шлюз системы. Принимает внешние HTTP-запросы, валидирует их с помощью Pydantic и координирует выполнение задач агентами через брокер сообщений.
-- **Шина данных (NATS)**: Высокопроизводительный брокер для асинхронного обмена сообщениями между сервисами по паттерну Request-Reply.
-- **База данных (Redis)**: Хранилище для сохранения персистентного состояния (state) агентов.
-- **Агенты (Golang)**: Три изолированных микросервиса обработки бизнес-логики.
-
-### Спроектированные агенты:
-1. **Агент «Запись к врачу»** (`agents/appointment`) — обрабатывает создание заявок на прием.
-2. **Агент «Напоминание о приеме»** (`agents/reminder`) — автоматически вызывается в цепочке (pipeline) после успешной записи.
-3. **Агент «Сбор обратной связи»** (`agents/feedback`) — сохраняет отзывы пациентов и использует Redis для инкрементального подсчета статистики.
+**Студент:** Тарасов Вадим Романович, группа 221131
 
 ---
 
-## 📂 Структура проекта
+## 🏗 Архитектура системы
 
-```text
-├── agents/
-│   ├── appointment/       # Go-агент записи к врачу
-│   │   ├── main.go
-│   │   └── go.mod
-│   ├── feedback/          # Go-агент отзывов (Stateful + Redis)
-│   │   ├── main.go
-│   │   └── go.mod
-│   └── reminder/          # Go-агент напоминаний
-│       ├── main.go
-│       └── go.mod
-├── orchestrator/          # Python-оркестратор (FastAPI)
-│   ├── app/
-│   │   ├── config.py
-│   │   └── main.py
-│   ├── .env               # Локальные переменные среды окружения
-│   └── requirements.txt
-├── docker-compose.yml     # Инфраструктура (NATS, Redis, Jaeger)
-└── .gitignore
+Система состоит из центрального **Оркестратора** (Python/FastAPI) и четырех **Микросервисов-агентов** (Go), обменивающихся сообщениями через **NATS**.
+
+### Диаграмма взаимодействия (Pipeline)
+
+```mermaid
+sequenceDiagram
+    participant Client
+    participant Orchestrator
+    participant TriageAgent
+    participant AppointmentAgent
+    Client->>Orchestrator: POST /patients/register
+    Orchestrator->>TriageAgent: patients.triage (symptoms)
+    TriageAgent-->>Orchestrator: triage.completed (priority, specialty)
+    Orchestrator->>AppointmentAgent: appointments.process (specialty)
+    AppointmentAgent-->>Orchestrator: appointments.completed (appointment_id)
+    Orchestrator-->>Client: 200 OK (appointment_details)
+
+```
+
+### Схема компонентов
+
+```mermaid
+graph TD
+    User((Пользователь)) --> Orchestrator[Оркестратор - FastAPI]
+    Orchestrator --> NATS{Шина NATS}
+    subgraph "Агенты (Microservices)"
+        NATS --> TriageAgent[Triage Agent - Go]
+        NATS --> ApptAgent[Appointment Agent - Go]
+        NATS --> RemindAgent[Reminder Agent - Go]
+        NATS --> FeedAgent[Feedback Agent - Go]
+    end
+    TriageAgent -->|Анализ симптомов| NATS
+    ApptAgent -->|Запись| NATS
+    RemindAgent -->|Уведомление| NATS
+    FeedAgent -->|Оценка| NATS
+
+```
+
+---
+
+## ⚙️ Агенты системы
+
+1. **Triage Agent (Go):** Анализирует жалобы и симптомы, классифицирует серьезность и рекомендует специалиста.
+2. **Appointment Agent (Go):** Отвечает за логику записи на прием.
+3. **Reminder Agent (Go):** Генерирует напоминания о визитах.
+4. **Feedback Agent (Go):** Собирает отзывы пациентов.
+
+## 🚀 Быстрый старт
+
+1. Склонируйте репозиторий.
+2. Запустите всю систему командой:
+```bash
+docker compose up --build
+
+```
+
+
+3. API будет доступно по адресу `http://localhost:8000`.
+
+## 📡 Примеры API-запросов
+
+**Регистрация пациента:**
+`POST /patients/register`
+
+```json
+{
+  "patient_id": "PAT001",
+  "first_name": "Иван",
+  "last_name": "Петров",
+  "symptoms": ["chest pain"],
+  "urgency": "high"
+}
+
+```
+
+## 🛡 Отказоустойчивость
+
+* **Таймауты:** Оркестратор ждет ответа от агентов не более 5 секунд.
+* **Изоляция:** Каждый агент функционирует в отдельном контейнере, отказ одного не блокирует остальные.
+
+```
+
+---
+
