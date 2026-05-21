@@ -1,76 +1,71 @@
 
-# 🏥 Система поддержки пациентов (Lab 13)
+# Система поддержки пациентов (Lab 13, вариант 18)
 
-Система автоматизации процессов записи и обслуживания пациентов на базе микросервисной архитектуры. Реализована в рамках лабораторной работы №13 (Вариант 18).
+Система автоматизации записи и обслуживания пациентов на базе мультиагентной архитектуры (MAS).
 
 **Студент:** Тарасов Вадим Романович, группа 221131
 
+**Предметная область:** запись к врачу, напоминание о приёме, сбор обратной связи, триаж.
+
 ---
 
-## 🏗 Архитектура системы
+## Архитектура
 
-Система состоит из центрального **Оркестратора** (Python/FastAPI) и четырех **Микросервисов-агентов** (Go), обменивающихся сообщениями через **NATS**.
+| Компонент | Технология | Роль |
+|-----------|------------|------|
+| Оркестратор | Python / FastAPI | Pipeline, аукцион, retry, REST API |
+| Triage Agent | Go | Классификация симптомов, приоритет |
+| Appointment Agent ×2 | Go | Запись к врачу (балансировка + аукцион) |
+| Reminder Agent | Go | Напоминания о визите |
+| Feedback Agent | Go + Redis | Stateful-сбор отзывов |
+| LLM Agent | Python | Анализ симптомов (имитация LLM) |
+| NATS | Docker | Брокер сообщений |
+| Jaeger | Docker | Распределённая трассировка (OpenTelemetry) |
 
-### Диаграмма взаимодействия (Pipeline)
+### Pipeline
 
 ```mermaid
 sequenceDiagram
     participant Client
     participant Orchestrator
-    participant TriageAgent
-    participant AppointmentAgent
+    participant Triage
+    participant LLM
+    participant Appointment
+    participant Reminder
+    participant Feedback
     Client->>Orchestrator: POST /patients/register
-    Orchestrator->>TriageAgent: patients.triage (symptoms)
-    TriageAgent-->>Orchestrator: triage.completed (priority, specialty)
-    Orchestrator->>AppointmentAgent: appointments.process (specialty)
-    AppointmentAgent-->>Orchestrator: appointments.completed (appointment_id)
-    Orchestrator-->>Client: 200 OK (appointment_details)
-
-```
-
-### Схема компонентов
-
-```mermaid
-graph TD
-    User((Пользователь)) --> Orchestrator[Оркестратор - FastAPI]
-    Orchestrator --> NATS{Шина NATS}
-    subgraph "Агенты (Microservices)"
-        NATS --> TriageAgent[Triage Agent - Go]
-        NATS --> ApptAgent[Appointment Agent - Go]
-        NATS --> RemindAgent[Reminder Agent - Go]
-        NATS --> FeedAgent[Feedback Agent - Go]
-    end
-    TriageAgent -->|Анализ симптомов| NATS
-    ApptAgent -->|Запись| NATS
-    RemindAgent -->|Уведомление| NATS
-    FeedAgent -->|Оценка| NATS
-
+    Orchestrator->>Triage: tasks.triage
+    Triage-->>Orchestrator: priority, specialty
+    Orchestrator->>LLM: tasks.llm
+    LLM-->>Orchestrator: analysis
+    Orchestrator->>Appointment: tasks.appointment (auction)
+    Appointment-->>Orchestrator: appointment_id
+    Orchestrator->>Reminder: tasks.reminder
+    Reminder-->>Orchestrator: sent
+    Orchestrator->>Feedback: tasks.feedback
+    Feedback-->>Orchestrator: stats from Redis
+    Orchestrator-->>Client: 200 OK
 ```
 
 ---
 
-## ⚙️ Агенты системы
+## Быстрый старт
 
-1. **Triage Agent (Go):** Анализирует жалобы и симптомы, классифицирует серьезность и рекомендует специалиста.
-2. **Appointment Agent (Go):** Отвечает за логику записи на прием.
-3. **Reminder Agent (Go):** Генерирует напоминания о визитах.
-4. **Feedback Agent (Go):** Собирает отзывы пациентов.
-
-## 🚀 Быстрый старт
-
-1. Склонируйте репозиторий.
-2. Запустите всю систему командой:
 ```bash
+cp .env.example .env
 docker compose up --build
-
 ```
 
+- API: http://localhost:8000/docs
+- Мониторинг: http://localhost:8000/monitor
+- Jaeger: http://localhost:16686
 
-3. API будет доступно по адресу `http://localhost:8000`.
+---
 
-## 📡 Примеры API-запросов
+## API
 
-**Регистрация пациента:**
+### Регистрация пациента (основной endpoint)
+
 `POST /patients/register`
 
 ```json
@@ -79,17 +74,44 @@ docker compose up --build
   "first_name": "Иван",
   "last_name": "Петров",
   "symptoms": ["chest pain"],
-  "urgency": "high"
+  "urgency": "high",
+  "appointment_date": "2026-05-25",
+  "rating": 5
 }
-
 ```
 
-## 🛡 Отказоустойчивость
+### Статус системы
 
-* **Таймауты:** Оркестратор ждет ответа от агентов не более 5 секунд.
-* **Изоляция:** Каждый агент функционирует в отдельном контейнере, отказ одного не блокирует остальные.
-
-```
+- `GET /health` — проверка работоспособности
+- `GET /status` — агенты, счётчик задач, аукцион
+- `GET /monitor` — веб-панель мониторинга
 
 ---
 
+## Реализованные требования (повышенная сложность)
+
+1. **4 Go-агента + LLM** — triage, appointment (×2), reminder, feedback, llm
+2. **Pipeline** — последовательная цепочка через оркестратор
+3. **Jaeger / OpenTelemetry** — OTLP exporter в оркестраторе и агентах
+4. **Stateful (Redis)** — feedback-agent хранит счётчики в Redis
+5. **Автомасштабирование** — проверка длины очереди в оркестраторе
+6. **Аукцион** — выбор appointment-agent с минимальным `cost`
+7. **LLM-агент** — анализ симптомов на Python
+8. **Мониторинг** — `/monitor`, `/status`
+
+Дополнительно: **retry до 3 раз**, **логи в файл**, **Request-Reply NATS**, **2 экземпляра appointment-agent**.
+
+---
+
+## Тесты
+
+```bash
+cd orchestrator
+pip install -r requirements.txt
+pytest app/tests -v
+```
+
+```bash
+cd agents/triage
+go test ./...
+```

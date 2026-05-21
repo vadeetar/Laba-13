@@ -1,7 +1,4 @@
-version: '3.9'
-
 services:
-
   nats:
     image: nats:latest
     ports:
@@ -18,52 +15,107 @@ services:
     ports:
       - "16686:16686"
       - "4318:4318"
+    environment:
+      - COLLECTOR_OTLP_ENABLED=true
 
   orchestrator:
     build: ./orchestrator
     ports:
       - "8000:8000"
+    env_file:
+      - .env
+    environment:
+      - NATS_URL=nats://nats:4222
+      - OTEL_EXPORTER_OTLP_ENDPOINT=http://jaeger:4318
+      - LOG_FILE=/app/logs/orchestrator.log
+    volumes:
+      - orchestrator-logs:/app/logs
+    depends_on:
+      - nats
+      - jaeger
+      - redis
+
+  triage-agent:
+    build: ./agents/triage
+    environment:
+      - NATS_URL=nats://nats:4222
+      - OTEL_EXPORTER_OTLP_ENDPOINT=http://jaeger:4318
+      - OTEL_SERVICE_NAME=triage-agent
+      - LOG_FILE=/app/logs/triage.log
+    volumes:
+      - agent-logs:/app/logs
+    depends_on:
+      - nats
+      - jaeger
+
+  appointment-agent:
+    build: ./agents/appointment
+    environment:
+      - NATS_URL=nats://nats:4222
+      - OTEL_EXPORTER_OTLP_ENDPOINT=http://jaeger:4318
+      - OTEL_SERVICE_NAME=appointment-agent
+      - AGENT_ID=appointment-agent
+      - AGENT_COST=3
+      - LOG_FILE=/app/logs/appointment-1.log
+    volumes:
+      - agent-logs:/app/logs
+    depends_on:
+      - nats
+      - jaeger
+
+  appointment-agent-2:
+    build: ./agents/appointment
+    environment:
+      - NATS_URL=nats://nats:4222
+      - OTEL_EXPORTER_OTLP_ENDPOINT=http://jaeger:4318
+      - OTEL_SERVICE_NAME=appointment-agent-2
+      - AGENT_ID=appointment-agent-2
+      - AGENT_COST=1
+      - LOG_FILE=/app/logs/appointment-2.log
+    volumes:
+      - agent-logs:/app/logs
+    depends_on:
+      - nats
+      - jaeger
+
+  reminder-agent:
+    build: ./agents/reminder
+    environment:
+      - NATS_URL=nats://nats:4222
+      - OTEL_EXPORTER_OTLP_ENDPOINT=http://jaeger:4318
+      - OTEL_SERVICE_NAME=reminder-agent
+      - LOG_FILE=/app/logs/reminder.log
+    volumes:
+      - agent-logs:/app/logs
+    depends_on:
+      - nats
+      - jaeger
+
+  feedback-agent:
+    build: ./agents/feedback
+    environment:
+      - NATS_URL=nats://nats:4222
+      - REDIS_ADDR=redis:6379
+      - OTEL_EXPORTER_OTLP_ENDPOINT=http://jaeger:4318
+      - OTEL_SERVICE_NAME=feedback-agent
+      - LOG_FILE=/app/logs/feedback.log
+    volumes:
+      - agent-logs:/app/logs
     depends_on:
       - nats
       - redis
       - jaeger
+
+  llm-agent:
+    build: ./agents/llm
     environment:
       - NATS_URL=nats://nats:4222
-
-  appointment-agent:
-    build:
-      context: .
-      dockerfile: agents/appointment/Dockerfile
+      - LOG_FILE=/app/logs/llm.log
+    volumes:
+      - agent-logs:/app/logs
     depends_on:
       - nats
-    environment:
-      - NATS_URL=nats://nats:4222
 
-  reminder-agent:
-    build:
-      context: .
-      dockerfile: agents/reminder/Dockerfile
-    depends_on:
-      - nats
-    environment:
-      - NATS_URL=nats://nats:4222
-
-  feedback-agent:
-    build:
-      context: .
-      dockerfile: agents/feedback/Dockerfile
-    depends_on:
-      - nats
-      - redis
-    environment:
-      - NATS_URL=nats://nats:4222
-      - REDIS_ADDR=redis:6379
-
-  triage-agent:
-    build:
-      context: .
-      dockerfile: agents/triage/Dockerfile
-    depends_on:
-      - nats
-    environment:
-      - NATS_URL=nats://nats:4222
+volumes:
+  orchestrator-logs:
+  agent-logs:

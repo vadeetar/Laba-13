@@ -1,5 +1,9 @@
-FROM python:3.9-slim
+FROM python:3.12-slim
+
 WORKDIR /app
-COPY . .
-RUN pip install nats-py
+
+RUN mkdir -p /app/logs && pip install --no-cache-dir nats-py
+
+COPY main.py .
+
 CMD ["python", "main.py"]

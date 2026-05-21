@@ -7,6 +7,7 @@ COPY . .
 RUN go mod tidy && CGO_ENABLED=0 GOOS=linux go build -o main .
 
 FROM alpine:latest
+RUN mkdir -p /app/logs
 WORKDIR /root/
 COPY --from=builder /app/main .
 CMD ["./main"]
