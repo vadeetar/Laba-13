@@ -1,11 +1,6 @@
-FROM golang:1.24-alpine AS builder
+FROM python:3.9-slim
 WORKDIR /app
-# Копируем всё содержимое
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
 COPY . .
-# Скачиваем зависимости и собираем
-RUN go mod tidy && go build -o main .
-
-FROM alpine:latest
-WORKDIR /root/
-COPY --from=builder /app/main .
-CMD ["./main"]
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
