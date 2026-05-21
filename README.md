@@ -31,3 +31,20 @@ sequenceDiagram
     Orchestrator->>AppointmentAgent: appointments.process (specialty)
     AppointmentAgent-->>Orchestrator: appointments.completed (appointment_id)
     Orchestrator-->>Client: 200 OK (appointment_details)
+
+
+graph TD
+    User((Пользователь)) --> Orchestrator[Оркестратор - FastAPI]
+    Orchestrator --> NATS{Шина NATS}
+    
+    subgraph "Агенты (Microservices)"
+        NATS --> TriageAgent[Triage Agent - Go]
+        NATS --> ApptAgent[Appointment Agent - Go]
+        NATS --> RemindAgent[Reminder Agent - Go]
+        NATS --> FeedAgent[Feedback Agent - Go]
+    end
+    
+    TriageAgent -->|Анализ симптомов| NATS
+    ApptAgent -->|Запись| NATS
+    RemindAgent -->|Уведомление| NATS
+    FeedAgent -->|Оценка| NATS
