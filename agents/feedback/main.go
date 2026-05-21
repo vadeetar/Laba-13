@@ -3,60 +3,98 @@ package main
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"log"
+	"os"
 
 	"github.com/nats-io/nats.go"
+
 	"github.com/redis/go-redis/v9"
+
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/sdk/trace"
 )
 
-type Task struct {
-	ID      string `json:"id"`
-	Type    string `json:"type"`
-	Payload string `json:"payload"`
+type FeedbackTask struct {
+	Patient string `json:"patient"`
+	Rating  int    `json:"rating"`
 }
 
-var ctx = context.Background()
+func initTracer() {
+	tp := trace.NewTracerProvider()
+	otel.SetTracerProvider(tp)
+}
 
 func main() {
-	// Подключаемся к NATS
-	nc, err := nats.Connect("nats://127.0.0.1:4222")
+
+	initTracer()
+
+	ctx := context.Background()
+
+	natsURL := os.Getenv("NATS_URL")
+	redisAddr := os.Getenv("REDIS_ADDR")
+
+	if natsURL == "" {
+		natsURL = "nats://nats:4222"
+	}
+
+	if redisAddr == "" {
+		redisAddr = "redis:6379"
+	}
+
+	rdb := redis.NewClient(&redis.Options{
+		Addr: redisAddr,
+	})
+
+	nc, err := nats.Connect(natsURL)
+
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer nc.Close()
 
-	// Подключаемся к Redis
-	rdb := redis.NewClient(&redis.Options{
-		Addr: "127.0.0.1:6379",
-	})
+	log.Println("Feedback Agent connected")
 
-	// Проверяем связь с Redis
-	if err := rdb.Ping(ctx).Err(); err != nil {
-		log.Fatalf("❌ Ошибка подключения к Redis: %v", err)
-	}
+	tracer := otel.Tracer("feedback-agent")
 
-	log.Println("📊 Агент 'Сбор обратной связи' запущен и подключен к Redis...")
+	_, err = nc.QueueSubscribe("tasks.feedback", "feedback-workers", func(msg *nats.Msg) {
 
-	nc.Subscribe("tasks.feedback", func(m *nats.Msg) {
-		var task Task
-		json.Unmarshal(m.Data, &task)
-		log.Printf("📥 Получен отзыв: %s", task.ID)
+		_, span := tracer.Start(context.Background(), "feedback-processing")
+		defer span.End()
 
-		// Увеличиваем счетчик отзывов в Redis на 1
-		newCount, err := rdb.Incr(ctx, "total_feedbacks").Result()
+		var task FeedbackTask
+
+		err := json.Unmarshal(msg.Data, &task)
+
 		if err != nil {
-			log.Printf("❌ Ошибка работы с Redis: %v", err)
+			log.Println(err)
 			return
 		}
 
-		// Формируем ответ с учетом статистики из кэша
-		outputMsg := fmt.Sprintf("Отзыв сохранен. Всего собрано отзывов: %d", newCount)
-		response := `{"task_id": "` + task.ID + `", "success": true, "output": "` + outputMsg + `"}`
+		count, err := rdb.Incr(ctx, "total_feedbacks").Result()
 
-		m.Respond([]byte(response))
-		log.Printf("📤 Ответ отправлен. Текущий счетчик: %d", newCount)
+		if err != nil {
+			log.Println(err)
+			return
+		}
+
+		log.Printf("Feedback from %s rating=%d total=%d\n",
+			task.Patient,
+			task.Rating,
+			count,
+		)
+
+		response := map[string]interface{}{
+			"status": "saved",
+			"count":  count,
+		}
+
+		data, _ := json.Marshal(response)
+
+		nc.Publish("tasks.feedback.done", data)
 	})
+
+	if err != nil {
+		log.Fatal(err)
+	}
 
 	select {}
 }

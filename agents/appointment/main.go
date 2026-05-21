@@ -1,40 +1,86 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"log"
+	"os"
+
 	"github.com/nats-io/nats.go"
+
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/sdk/trace"
 )
 
-type Task struct {
+type AppointmentTask struct {
 	ID      string `json:"id"`
-	Type    string `json:"type"`
-	Payload string `json:"payload"`
+	Patient string `json:"patient"`
+	Date    string `json:"date"`
+}
+
+type AppointmentResult struct {
+	Status  string `json:"status"`
+	Message string `json:"message"`
+}
+
+func initTracer() {
+	tp := trace.NewTracerProvider()
+	otel.SetTracerProvider(tp)
 }
 
 func main() {
-	nc, err := nats.Connect("nats://127.0.0.1:4222")
+
+	initTracer()
+
+	natsURL := os.Getenv("NATS_URL")
+
+	if natsURL == "" {
+		natsURL = "nats://nats:4222"
+	}
+
+	nc, err := nats.Connect(natsURL)
+
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer nc.Close()
 
-	log.Println("Агент 'Запись к врачу' запущен и ожидает задачи...")
+	log.Println("Appointment Agent connected to NATS")
 
-	nc.Subscribe("tasks.appointment", func(m *nats.Msg) {
-		var task Task
-		json.Unmarshal(m.Data, &task)
-		log.Printf("📥 Получен запрос на запись: %s", task.ID)
+	tracer := otel.Tracer("appointment-agent")
 
-		response := `{"task_id": "` + task.ID + `", "success": true, "output": "Запись подтверждена"}`
+	_, err = nc.QueueSubscribe("tasks.appointment", "appointment-workers", func(msg *nats.Msg) {
 
-		err := m.Respond([]byte(response))
+		ctx, span := tracer.Start(context.Background(), "appointment-processing")
+		defer span.End()
+
+		var task AppointmentTask
+
+		err := json.Unmarshal(msg.Data, &task)
+
 		if err != nil {
-			log.Printf("❌ Ошибка при отправке ответа: %v", err)
-		} else {
-			log.Println("📤 Ответ успешно отправлен в Оркестратор")
+			log.Println(err)
+			return
 		}
+
+		log.Printf("Appointment request: %+v\n", task)
+
+		result := AppointmentResult{
+			Status:  "success",
+			Message: "Appointment created for " + task.Patient,
+		}
+
+		data, _ := json.Marshal(result)
+
+		nc.Publish("tasks.appointment.done", data)
+
+		log.Println("Appointment processed")
+
+		_ = ctx
 	})
+
+	if err != nil {
+		log.Fatal(err)
+	}
 
 	select {}
 }

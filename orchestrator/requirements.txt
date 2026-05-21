@@ -1,8 +1,7 @@
-fastapi==0.110.0
-uvicorn==0.29.0
-nats-py==2.7.0
+fastapi
+uvicorn
+nats-py
+
 opentelemetry-api
 opentelemetry-sdk
 opentelemetry-exporter-otlp
-prometheus_client
-httpx

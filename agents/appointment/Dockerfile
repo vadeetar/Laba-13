@@ -1,9 +1,11 @@
-FROM golang:1.25-alpine AS builder
-WORKDIR /app
-COPY . .
-RUN go mod download && go build -o main .
+FROM golang:1.23-alpine
 
-FROM alpine:latest
-WORKDIR /root/
-COPY --from=builder /app/main .
-CMD ["./main"]
+WORKDIR /app
+
+COPY . .
+
+RUN go mod tidy
+
+RUN go build -o agent .
+
+CMD ["./agent"]

@@ -1,41 +1,69 @@
 version: '3.9'
+
 services:
+
   nats:
     image: nats:latest
-    ports: ["4222:4222"]
+    ports:
+      - "4222:4222"
+      - "8222:8222"
 
   redis:
-    image: redis:alpine
+    image: redis:7
+    ports:
+      - "6379:6379"
 
   jaeger:
     image: jaegertracing/all-in-one:latest
-    ports: ["16686:16686", "4318:4318"]
+    ports:
+      - "16686:16686"
+      - "4318:4318"
 
   orchestrator:
     build: ./orchestrator
+    ports:
+      - "8000:8000"
+    depends_on:
+      - nats
+      - redis
+      - jaeger
     environment:
       - NATS_URL=nats://nats:4222
-      - REDIS_URL=redis://redis:6379
-      - JAEGER_URL=http://jaeger:4318
-    depends_on: [nats, redis, jaeger]
-    ports: ["8000:8000"]
-
-  triage-agent:
-    build: ./agents/triage
-    environment: [NATS_URL=nats://nats:4222, REDIS_URL=redis://redis:6379]
 
   appointment-agent:
-    build: ./agents/appointment
-    environment: [NATS_URL=nats://nats:4222]
+    build:
+      context: .
+      dockerfile: agents/appointment/Dockerfile
+    depends_on:
+      - nats
+    environment:
+      - NATS_URL=nats://nats:4222
 
   reminder-agent:
-    build: ./agents/reminder
-    environment: [NATS_URL=nats://nats:4222]
+    build:
+      context: .
+      dockerfile: agents/reminder/Dockerfile
+    depends_on:
+      - nats
+    environment:
+      - NATS_URL=nats://nats:4222
 
   feedback-agent:
-    build: ./agents/feedback
-    environment: [NATS_URL=nats://nats:4222]
+    build:
+      context: .
+      dockerfile: agents/feedback/Dockerfile
+    depends_on:
+      - nats
+      - redis
+    environment:
+      - NATS_URL=nats://nats:4222
+      - REDIS_ADDR=redis:6379
 
-  llm-agent:
-    build: ./agents/llm
-    environment: [NATS_URL=nats://nats:4222]
+  triage-agent:
+    build:
+      context: .
+      dockerfile: agents/triage/Dockerfile
+    depends_on:
+      - nats
+    environment:
+      - NATS_URL=nats://nats:4222
