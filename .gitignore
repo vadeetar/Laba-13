@@ -1,0 +1,11 @@
+.env
+*.env
+.venv/
+venv/
+.idea/
+.vscode/
+__pycache__/
+*.exe
+agents/appointment/appointment
+agents/reminder/reminder
+agents/feedback/feedback
