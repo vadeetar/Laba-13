@@ -1,18 +1,61 @@
-version: '3.8'
+version: '3.9'
+
 services:
   nats:
     image: nats:latest
     ports:
       - "4222:4222"
       - "8222:8222"
-  
+    restart: always
+
   redis:
-    image: redis:alpine
+    image: redis:7-alpine
     ports:
       - "6379:6379"
+    restart: always
 
   jaeger:
     image: jaegertracing/all-in-one:latest
     ports:
       - "16686:16686"
-      - "4317:4317"
+      - "4318:4318"
+    restart: always
+
+  orchestrator:
+    build: ./orchestrator
+    depends_on:
+      - nats
+      - redis
+      - jaeger
+    environment:
+      - NATS_URL=nats://nats:4222
+      - REDIS_URL=redis://redis:6379
+      - OTEL_EXPORTER_OTLP_ENDPOINT=http://jaeger:4318
+    ports:
+      - "8000:8000"
+    restart: always
+
+  appointment-agent:
+    build: ./agents/appointment
+    depends_on:
+      - nats
+    restart: always
+
+  reminder-agent:
+    build: ./agents/reminder
+    depends_on:
+      - nats
+    restart: always
+
+  feedback-agent:
+    build: ./agents/feedback
+    depends_on:
+      - nats
+    restart: always
+
+  triage-agent:
+    build: ./agents/triage
+    depends_on:
+      - nats
+      - redis
+    restart: always

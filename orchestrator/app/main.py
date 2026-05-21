@@ -1,84 +1,59 @@
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
 import nats
 import json
-import uuid
 import asyncio
-from datetime import datetime
-from app.config import settings
+from prometheus_client import Counter, make_asgi_app
+from opentelemetry import trace
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import BatchSpanProcessor
+from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
 
-app = FastAPI(title="Оркестратор: Система поддержки пациентов")
-nc = nats.NATS()
+# Настройка Трейсинга (Jaeger)
+trace.set_tracer_provider(TracerProvider())
+tracer = trace.get_tracer(__name__)
+otlp_exporter = OTLPSpanExporter(endpoint="http://jaeger:4318/v1/traces")
+trace.get_tracer_provider().add_span_processor(BatchSpanProcessor(otlp_exporter))
 
+# Метрики
+REQUEST_COUNTER = Counter('processed_requests', 'Processed requests count')
 
-# --- СХЕМЫ ДАННЫХ ---
-class AppointmentRequest(BaseModel):
-    patient_id: str
-    doctor_specialty: str
-    preferred_time: datetime
+app = FastAPI()
 
+# Добавляем метрики Prometheus
+metrics_app = make_asgi_app()
+app.mount("/metrics", metrics_app)
 
-class FeedbackRequest(BaseModel):
-    patient_id: str
-    rating: int
-    comments: str
+@app.get('/health')
+async def health():
+    return {'status': 'ok'}
 
+async def send_with_retry(nc, subject, data, retries=3):
+    for attempt in range(retries):
+        try:
+            with tracer.start_as_current_span(f"attempt_{attempt}"):
+                resp = await nc.request(subject, json.dumps(data).encode(), timeout=5)
+                return json.loads(resp.data.decode())
+        except Exception as e:
+            if attempt == retries - 1: raise e
+            await asyncio.sleep(1)
 
-# --- СТАРТ И СТОП СЕРВЕРА ---
-@app.on_event("startup")
-async def startup():
-    await nc.connect(settings.nats_url)
-    print("✅ Оркестратор подключен к NATS")
-
-
-@app.on_event("shutdown")
-async def shutdown():
-    await nc.close()
-
-
-# --- МЕТОД 1: ЗАПИСЬ К ВРАЧУ (PIPELINE) ---
-@app.post("/appointments/")
-async def create_appointment_pipeline(request: AppointmentRequest):
-    task_id = str(uuid.uuid4())
-    task_payload = request.model_dump_json()
-    appointment_task = {"id": task_id, "type": "appointment", "payload": task_payload}
-
-    try:
-        msg1 = await nc.request("tasks.appointment", json.dumps(appointment_task).encode(), timeout=5.0)
-        result1 = json.loads(msg1.data.decode())
-
-        if not result1.get("success"):
-            return {"status": "error", "message": "Не удалось создать запись"}
-
-        reminder_task = {"id": task_id, "type": "reminder", "payload": json.dumps(result1)}
-        msg2 = await nc.request("tasks.reminder", json.dumps(reminder_task).encode(), timeout=5.0)
-        result2 = json.loads(msg2.data.decode())
-
-        return {
-            "status": "success",
-            "pipeline_results": {
-                "step_1_appointment": result1["output"],
-                "step_2_reminder": result2["output"]
-            }
-        }
-    except asyncio.TimeoutError:
-        raise HTTPException(status_code=504, detail="Один из агентов цепочки не ответил вовремя")
-
-
-# --- МЕТОД 2: СБОР ОТЗЫВОВ (С СОХРАНЕНИЕМ СОСТОЯНИЯ) ---
-@app.post("/feedback/")
-async def collect_feedback(request: FeedbackRequest):
-    task_id = str(uuid.uuid4())
-
-    task = {
-        "id": task_id,
-        "type": "feedback",
-        "payload": request.model_dump_json()
-    }
-
-    try:
-        msg = await nc.request("tasks.feedback", json.dumps(task).encode(), timeout=5.0)
-        result = json.loads(msg.data.decode())
-        return {"status": "success", "agent_response": result}
-    except asyncio.TimeoutError:
-        raise HTTPException(status_code=504, detail="Go-агент 'Сбор обратной связи' не отвечает")
+@app.post("/patients/register")
+async def register_patient(data: dict):
+    REQUEST_COUNTER.inc()
+    nc = await nats.connect("nats://nats:4222")
+    
+    with tracer.start_as_current_span("main_request") as span:
+        try:
+            # 1. Triage с повторами
+            triage_data = await send_with_retry(nc, "patients.triage", data)
+            
+            # 2. Appointment
+            app_req = {"patient_id": data["patient_id"], "specialty": triage_data["recommended_specialty"]}
+            app_data = await send_with_retry(nc, "appointments.process", app_req)
+            
+            return {"status": "success", "appointment": app_data, "triage": triage_data}
+        except Exception as e:
+            span.set_attribute("error", True)
+            raise HTTPException(status_code=500, detail=str(e))
+        finally:
+            await nc.close()
